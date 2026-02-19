@@ -2,152 +2,128 @@ import osmnx as ox
 import networkx as nx
 import random
 import math
-import matplotlib.pyplot as plt
 import numpy as np
 import time
 import warnings
 
+# Suppress warnings / Приховуємо попередження
 warnings.filterwarnings("ignore")
 
 class UrbanDeliveryOptimizer:
     def __init__(self, place_name, num_orders=10):
         """
-        Ініціалізація оптимізатора.
+        Backend initialization. Loads graph and prepares data.
+        Ініціалізація бекенду. Завантаження графа та підготовка даних.
         """
-        print(f"[INIT] Завантаження карти для: {place_name}...")
+        print(f"[BACKEND] Loading map: {place_name}...")
         
-        # 1. Завантажуємо граф дорожньої мережі
-        self.G = ox.graph_from_place(place_name, network_type='drive')
+        strict_filter = (
+            '["highway"]["area"!~"yes"]'
+            '["access"!~"private|no|customers"]'
+            '["motor_vehicle"!~"no"]'
+            '["highway"!~"pedestrian|path|footway|steps|track|construction"]'
+        )
+
+        # 1. Load Graph / Завантаження графа
+        self.G = ox.graph_from_place(place_name, network_type='drive', custom_filter=strict_filter)
         
-        print("[INIT] Фільтрація ізольованих ділянок...")
+        # 2. Filter isolated nodes / Фільтрація ізольованих вузлів
         largest_cc = max(nx.strongly_connected_components(self.G), key=len)
         self.G = self.G.subgraph(largest_cc).copy()
         
-        # Проектуємо граф в метри
+        # 3. Project to meters (for calculations) / Проекція в метри (для розрахунків)
+        # We keep self.G (lat/lon) for markers and self.G_proj (meters) for distances
         try:
-            self.G = ox.project_graph(self.G)
+            self.G_proj = ox.project_graph(self.G)
         except AttributeError:
-             self.G = ox.projection.project_graph(self.G)
+            self.G_proj = ox.projection.project_graph(self.G)
         
-        self.nodes = list(self.G.nodes())
+        self.nodes = list(self.G_proj.nodes())
         
-        # Перевірка на достатню кількість вузлів
         if len(self.nodes) < num_orders + 1:
-            raise ValueError("Замало вузлів на карті для такої кількості замовлень!")
+            raise ValueError("Not enough nodes for this number of orders!")
 
-        self.depot = random.choice(self.nodes) # Депо (старт)
+        # 4. Generate Orders / Генерація замовлень
+        self.depot = random.choice(self.nodes)
+        available = [n for n in self.nodes if n != self.depot]
+        self.orders = random.sample(available, min(len(available), num_orders))
         
-        # Генеруємо випадкові точки доставки (виключаючи депо)
-        available_nodes = [n for n in self.nodes if n != self.depot]
-        self.orders = random.sample(available_nodes, num_orders)
-        
-        # Список всіх точок: Депо + Замовлення
         self.targets = [self.depot] + self.orders
         self.num_targets = len(self.targets)
         
-        # Кеш для матриці відстаней
+        # Matrix Cache / Кеш матриці
         self.dist_matrix = np.zeros((self.num_targets, self.num_targets))
-        print(f"[INIT] Карта підготовлена. Вузлів у графі: {len(self.nodes)}")
+        print(f"[BACKEND] Ready. Nodes: {len(self.nodes)}")
 
     def precalculate_distances(self):
-        """
-        Розрахунок матриці відстаней між усіма точками доставки.
-        """
-        print("[INFO] Розрахунок матриці відстаней (це може зайняти час)...")
+        """Calculates distance matrix / Розрахунок матриці відстаней"""
         for i in range(self.num_targets):
             for j in range(self.num_targets):
                 if i != j:
                     try:
-                        # Розрахунок найкоротшого шляху по дорогах
+                        # Use projected graph (meters) / Використовуємо проектований граф (метри)
                         length = nx.shortest_path_length(
-                            self.G, 
-                            self.targets[i], 
-                            self.targets[j], 
-                            weight='length'
+                            self.G_proj, self.targets[i], self.targets[j], weight='length'
                         )
-                        # Симуляція трафіку
+                        # Traffic noise / Шум трафіку
                         traffic_factor = random.uniform(1.0, 1.2)
                         self.dist_matrix[i][j] = length * traffic_factor
                     except nx.NetworkXNoPath:
-                        self.dist_matrix[i][j] = 1e9 # Велика відстань
-        print("[INFO] Матрицю розраховано.")
+                        self.dist_matrix[i][j] = 1e9
 
     def total_route_cost(self, route_indices):
-        """Функція енергії: загальна довжина маршруту"""
+        """Calculate total cost / Розрахунок повної вартості"""
         cost = 0
-        # Від депо до першої точки
         cost += self.dist_matrix[0][route_indices[0]]
-        
-        # Між точками маршруту
         for i in range(len(route_indices) - 1):
-            u = route_indices[i]
-            v = route_indices[i+1]
-            cost += self.dist_matrix[u][v]
-            
-        # Назад в депо
+            cost += self.dist_matrix[route_indices[i]][route_indices[i+1]]
         cost += self.dist_matrix[route_indices[-1]][0]
         return cost
 
-    def simulated_annealing(self, initial_route=None, initial_temp=1000, cooling_rate=0.995, max_iter=5000):
-        """
-        Основний алгоритм Симульованого Відпалу.
-        """
+    def simulated_annealing(self, initial_route=None, initial_temp=1000, cooling_rate=0.995, max_iter=2000):
+        """Simulated Annealing Algorithm / Алгоритм симульованого відпалу"""
         if initial_route is None:
             current_route = list(range(1, self.num_targets))
             random.shuffle(current_route)
         else:
             current_route = initial_route[:]
-
-        current_cost = self.total_route_cost(current_route)
         
+        current_cost = self.total_route_cost(current_route)
         best_route = current_route[:]
         best_cost = current_cost
-        
         temp = initial_temp
-        costs_history = [] 
-
-        start_time = time.time()
-
+        history = []
+        
         for i in range(max_iter):
             new_route = current_route[:]
+            if len(new_route) < 2: break
             
-            # ЕВРИСТИКА: Swap
+            # Swap Logic
             idx1, idx2 = random.sample(range(len(new_route)), 2)
             new_route[idx1], new_route[idx2] = new_route[idx2], new_route[idx1]
-
             new_cost = self.total_route_cost(new_route)
             
+            # Acceptance Probability
             delta = new_cost - current_cost
-            acceptance_prob = math.exp(-delta / temp) if delta > 0 else 1.0
-            
-            if random.random() < acceptance_prob:
+            if delta < 0 or random.random() < math.exp(-delta / temp):
                 current_route = new_route
                 current_cost = new_cost
-                
                 if current_cost < best_cost:
                     best_cost = current_cost
                     best_route = current_route[:]
+                    
+            history.append(best_cost)
+            temp *= cooling_rate
+            if temp < 1: break
             
-            costs_history.append(best_cost)
-            temp *= cooling_rate 
-            
-            if temp < 1:
-                break
-                
-        elapsed_time = time.time() - start_time
-        return best_route, best_cost, costs_history, elapsed_time
+        return best_route, best_cost, history
 
     def add_dynamic_order(self):
-        """Симуляція динамічного додавання замовлення"""
-        print("\n[DYNAMIC] Надійшло нове замовлення!")
+        """Adds a new order dynamically / Динамічне додавання замовлення"""
+        available = [n for n in self.nodes if n not in self.targets]
+        if not available: return None
         
-        # Вибираємо нову точку, якої ще немає в списку
-        available_nodes = [n for n in self.nodes if n not in self.targets]
-        if not available_nodes:
-            print("Немає вільних точок для нового замовлення.")
-            return None
-
-        new_node = random.choice(available_nodes)
+        new_node = random.choice(available)
         self.orders.append(new_node)
         self.targets.append(new_node)
         
@@ -160,122 +136,71 @@ class UrbanDeliveryOptimizer:
         for i in range(self.num_targets):
             if i != new_idx:
                 try:
-                    dist_to = nx.shortest_path_length(self.G, self.targets[i], self.targets[new_idx], weight='length')
-                    dist_from = nx.shortest_path_length(self.G, self.targets[new_idx], self.targets[i], weight='length')
-                    new_matrix[i][new_idx] = dist_to * 1.2 
-                    new_matrix[new_idx][i] = dist_from * 1.2
+                    d1 = nx.shortest_path_length(self.G_proj, self.targets[i], self.targets[new_idx], weight='length')
+                    d2 = nx.shortest_path_length(self.G_proj, self.targets[new_idx], self.targets[i], weight='length')
+                    new_matrix[i][new_idx] = d1 * 1.2
+                    new_matrix[new_idx][i] = d2 * 1.2
                 except:
                     new_matrix[i][new_idx] = 1e9
                     new_matrix[new_idx][i] = 1e9
-
+                    
         self.dist_matrix = new_matrix
         return new_idx
 
-    def visualize_route(self, route_indices, title="Маршрут"):
+    def get_route_coordinates(self, route_indices):
         """
-        Візуалізація маршруту на карті.
+        Returns list of [lat, lon] for Folium.
+        Повертає координати [lat, lon] для малювання ліній.
         """
-        full_path_indices = [0] + route_indices + [0]
+        full_indices = [0] + route_indices + [0]
+        coordinates = []
         
-        routes_to_plot = []
-        print("[INFO] Підготовка візуалізації...")
-        
-        for i in range(len(full_path_indices) - 1):
-            u = self.targets[full_path_indices[i]]
-            v = self.targets[full_path_indices[i+1]]
+        for i in range(len(full_indices) - 1):
+            u = self.targets[full_indices[i]]
+            v = self.targets[full_indices[i+1]]
+            
             try:
-                path = nx.shortest_path(self.G, u, v, weight='length')
-                routes_to_plot.append(path)
+                path_nodes = nx.shortest_path(self.G_proj, u, v, weight='length')
+                
+                # Проходимося по кожному відрізку (вулиці)
+                for k in range(len(path_nodes) - 1):
+                    n1 = path_nodes[k]
+                    n2 = path_nodes[k+1]
+                    
+                    edges = self.G.get_edge_data(n1, n2)
+                    if not edges: continue
+                    
+                    # Вибираємо найкоротший сегмент
+                    min_edge = min(edges.values(), key=lambda d: d.get('length', float('inf')))
+                    
+                    if 'geometry' in min_edge:
+                        for lon, lat in min_edge['geometry'].coords:
+                            coordinates.append([lat, lon])
+                    else:
+                        coordinates.append([self.G.nodes[n1]['y'], self.G.nodes[n1]['x']])
+                        coordinates.append([self.G.nodes[n2]['y'], self.G.nodes[n2]['x']])
+                        
             except nx.NetworkXNoPath:
                 pass
-
-        if not routes_to_plot:
-            print("Неможливо побудувати маршрут для відображення.")
-            return
-
-        # Малюємо множину маршрутів
-        # У нових версіях це зазвичай ox.plot.graph_routes, але старий аліас часто працює.
-        # Якщо впаде, ми спробуємо імпортувати явно.
-        try:
-            fig, ax = ox.plot_graph_routes(
-                self.G, 
-                routes_to_plot, 
-                route_colors='r', 
-                route_linewidth=3, 
-                node_size=0, 
-                show=False, 
-                close=False
-            )
-        except AttributeError:
-             # Fallback для найновіших версій v2.0+
-             fig, ax = ox.plot.plot_graph_routes(
-                self.G, 
-                routes_to_plot, 
-                route_colors='r', 
-                route_linewidth=3, 
-                node_size=0, 
-                show=False, 
-                close=False
-            )
-        
-        # Маркери
-        lats = [self.G.nodes[n]['y'] for n in self.targets]
-        lons = [self.G.nodes[n]['x'] for n in self.targets]
-        
-        ax.scatter(lons[0], lats[0], c='lime', s=120, edgecolors='black', label='Депо', zorder=10)
-        ax.scatter(lons[1:], lats[1:], c='cyan', s=60, edgecolors='black', label='Замовлення', zorder=10)
-        
-        plt.title(title)
-        plt.legend()
-        plt.show()
-
-
-# ================= ЗАПУСК =================
-if __name__ == "__main__":
-    place = "Korabelnyi District, Kherson, Ukraine"
+                
+        return coordinates
     
-    try:
-        optimizer = UrbanDeliveryOptimizer(place, num_orders=10)
-        
-        optimizer.precalculate_distances()
-        
-        print("\n--- Етап 1: Статична оптимізація ---")
-        best_route, cost, history, t_static = optimizer.simulated_annealing()
-        
-        if cost > 1e8:
-             print("УВАГА: Маршрут неоптимальний через недосяжні точки.")
-        else:
-            print(f"Оптимальний маршрут (індекси): {best_route}")
-            print(f"Довжина маршруту: {cost:.2f} м")
-            print(f"Час конвергенції: {t_static:.4f} сек")
-        
-        # Графік
-        plt.figure(figsize=(10, 5))
-        plt.plot(history)
-        plt.title("Конвергенція")
-        plt.xlabel("Ітерації")
-        plt.ylabel("Вартість")
-        plt.show()
-        
-        # Карта
-        optimizer.visualize_route(best_route, title="Початковий маршрут")
-
-        # Динаміка
-        print("\n--- Етап 2: Динамічні зміни ---")
-        new_idx = optimizer.add_dynamic_order()
-        
-        if new_idx:
-            current_best_route = best_route + [new_idx] 
-            
-            print("Перерахунок маршруту...")
-            dyn_route, dyn_cost, _, t_dyn = optimizer.simulated_annealing(
-                initial_route=current_best_route, 
-                initial_temp=200, 
-                max_iter=3000
-            )
-            
-            print(f"Нова довжина: {dyn_cost:.2f} м")
-            optimizer.visualize_route(dyn_route, title="Оновлений маршрут")
-            
-    except Exception as e:
-        print(f"Сталася помилка: {e}")
+    def get_markers(self):
+        """Returns data for map markers / Повертає дані для маркерів"""
+        markers = []
+        # Depot
+        d_node = self.targets[0]
+        markers.append({
+            "lat": self.G.nodes[d_node]['y'],
+            "lon": self.G.nodes[d_node]['x'],
+            "type": "depot"
+        })
+        # Orders
+        for i, node in enumerate(self.targets[1:]):
+            markers.append({
+                "lat": self.G.nodes[node]['y'],
+                "lon": self.G.nodes[node]['x'],
+                "type": "order",
+                "id": i + 1
+            })
+        return markers
