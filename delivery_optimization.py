@@ -19,9 +19,9 @@ class UrbanDeliveryOptimizer:
         
         strict_filter = (
             '["highway"]["area"!~"yes"]'
+            '["highway"~"trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential"]'
             '["access"!~"private|no|customers"]'
             '["motor_vehicle"!~"no"]'
-            '["highway"!~"pedestrian|path|footway|steps|track|construction"]'
         )
 
         # 1. Load Graph / Завантаження графа
@@ -80,8 +80,14 @@ class UrbanDeliveryOptimizer:
         cost += self.dist_matrix[route_indices[-1]][0]
         return cost
 
-    def simulated_annealing(self, initial_route=None, initial_temp=1000, cooling_rate=0.995, max_iter=2000):
+    def simulated_annealing(self, initial_route=None, initial_temp=1000, final_temp=0.1, max_iter=None):
         """Simulated Annealing Algorithm / Алгоритм симульованого відпалу"""
+        
+        if max_iter is None:
+            max_iter = 1000 + (self.num_targets * 300)  
+
+        cooling_rate = (final_temp / initial_temp) ** (1 / max_iter)
+
         if initial_route is None:
             current_route = list(range(1, self.num_targets))
             random.shuffle(current_route)
@@ -99,8 +105,8 @@ class UrbanDeliveryOptimizer:
             if len(new_route) < 2: break
             
             # Swap Logic
-            idx1, idx2 = random.sample(range(len(new_route)), 2)
-            new_route[idx1], new_route[idx2] = new_route[idx2], new_route[idx1]
+            idx1, idx2 = sorted(random.sample(range(len(new_route)), 2))
+            new_route[idx1:idx2+1] = reversed(new_route[idx1:idx2+1])
             new_cost = self.total_route_cost(new_route)
             
             # Acceptance Probability
@@ -138,9 +144,13 @@ class UrbanDeliveryOptimizer:
                 try:
                     d1 = nx.shortest_path_length(self.G_proj, self.targets[i], self.targets[new_idx], weight='length')
                     d2 = nx.shortest_path_length(self.G_proj, self.targets[new_idx], self.targets[i], weight='length')
-                    new_matrix[i][new_idx] = d1 * 1.2
-                    new_matrix[new_idx][i] = d2 * 1.2
-                except:
+
+                    noise1 = random.uniform(1.0, 1.2)
+                    noise2 = random.uniform(1.0, 1.2)
+                    
+                    new_matrix[i][new_idx] = d1 * noise1
+                    new_matrix[new_idx][i] = d2 * noise2
+                except nx.NetworkXNoPath: 
                     new_matrix[i][new_idx] = 1e9
                     new_matrix[new_idx][i] = 1e9
                     
@@ -171,8 +181,12 @@ class UrbanDeliveryOptimizer:
                     if not edges: continue
                     
                     # Вибираємо найкоротший сегмент
-                    min_edge = min(edges.values(), key=lambda d: d.get('length', float('inf')))
-                    
+                    valid_edges = [d for d in edges.values() if 'length' in d]
+                    if valid_edges:
+                        min_edge = min(valid_edges, key=lambda d: d['length'])
+                    else:
+                        min_edge = list(edges.values())[0]
+                        
                     if 'geometry' in min_edge:
                         for lon, lat in min_edge['geometry'].coords:
                             coordinates.append([lat, lon])
